@@ -268,6 +268,11 @@ class MeldApp(Gtk.Application):
             "-u", "--unified", action="store_true",
             help=_("Ignored for compatibility"))
         parser.add_option(
+            "-r", "--read-only", action="store_true", default=False,
+            help=_(
+                "Open comparisons read-only, never writing to the "
+                "compared files regardless of their on-disk permissions"))
+        parser.add_option(
             "-o", "--output", action="store", type="string",
             dest="outfile", default=None,
             help=_("Set the target file for saving a merge result"))
@@ -299,6 +304,9 @@ class MeldApp(Gtk.Application):
         if parser.should_exit:
             cleanup()
             return parser.exit_status
+
+        if options.read_only:
+            FileDiff.force_read_only = True
 
         if len(args) > 3:
             parser.local_error(_("too many arguments (wanted 0-3, got %d)") %

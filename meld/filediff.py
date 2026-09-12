@@ -15,6 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import copy
+import difflib
 import functools
 import logging
 import math
@@ -132,6 +133,12 @@ class FileDiff(Gtk.Box, MeldDoc):
         ('overview-map-style', 'overview-map-style'),
     )
 
+    #: Process-wide switch set by ``--read-only`` on the command line.
+    #: When true, every comparison opens non-editable regardless of the
+    #: underlying files' on-disk permissions, so Meld can never write to
+    #: files that are being edited concurrently by another program.
+    force_read_only: bool = False
+
     ignore_blank_lines = GObject.Property(
         type=bool,
         nick="Ignore blank lines",
@@ -207,7 +214,8 @@ class FileDiff(Gtk.Box, MeldDoc):
     }
 
     # Identifiers for MsgArea messages
-    (MSG_SAME, MSG_SLOW_HIGHLIGHT, MSG_SYNCPOINTS) = list(range(3))
+    (MSG_SAME, MSG_SLOW_HIGHLIGHT, MSG_SYNCPOINTS, MSG_RELOADED) = \
+        list(range(4))
     # Transient messages that should be removed if any file in the
     # comparison gets reloaded.
     TRANSIENT_MESSAGES = {MSG_SAME, MSG_SLOW_HIGHLIGHT}
@@ -269,6 +277,19 @@ class FileDiff(Gtk.Box, MeldDoc):
         self.meta = {}
         self.lines_removed = 0
         self.focus_pane = None
+        # Per-pane debounce state for --read-only auto-reload: a
+        # single external save commonly fires more than one
+        # GFileMonitor "changed" event (e.g. separate writes, then a
+        # changes-done hint), each bumping the on-disk mtime. Without
+        # coalescing these, each one would kick off its own competing
+        # reload-and-rescroll cycle, and whichever finished last would
+        # win with a cursor position that has nothing to do with the
+        # actual edit.
+        self._pending_reload = {}
+        # Per-pane counter guarding against overlapping reload
+        # cycles: only a poller whose generation still matches the
+        # latest value here is allowed to move the cursor.
+        self._reload_generation = {}
         self.textbuffer = [v.get_buffer() for v in self.textview]
         self.buffer_texts = [BufferLines(b) for b in self.textbuffer]
         self.undosequence = UndoSequence(self.textbuffer)
@@ -1893,11 +1914,168 @@ class FileDiff(Gtk.Box, MeldDoc):
             # Notification for unknown buffer
             return
         display_name = data.gfile.get_parse_name()
+
+        # In forced read-only mode, the pane can never have unsaved
+        # local edits, so an external change on disk can never clobber
+        # anything by reloading it straight away instead of waiting on
+        # the user to click "Reload".
+        if self.force_read_only and not self.textbuffer[pane].get_modified():
+            log.info(
+                "read-only auto-reload: change notified for pane %d (%s)",
+                pane, display_name)
+            # A single external save often fires this notification
+            # more than once (see _pending_reload's comment in
+            # __init__). Capture "old_text" only the *first* time in a
+            # burst, and keep pushing the actual reload back until the
+            # notifications stop arriving, so we only ever run one
+            # reload/rescroll cycle per real edit.
+            pending = self._pending_reload.get(pane)
+            if pending is None:
+                buf = self.textbuffer[pane]
+                start, end = buf.get_bounds()
+                pending = {'old_text': buf.get_text(start, end, False)}
+                self._pending_reload[pane] = pending
+                log.info(
+                    "read-only auto-reload: starting debounce window "
+                    "for pane %d", pane)
+            else:
+                GLib.source_remove(pending['timeout_id'])
+                log.info(
+                    "read-only auto-reload: another change arrived, "
+                    "restarting debounce window for pane %d", pane)
+
+            pending['timeout_id'] = GLib.timeout_add(
+                250, self._debounced_reload, pane, display_name)
+            return
+
         primary = _("File %s has changed on disk") % display_name
         secondary = _("Do you want to reload the file?")
         self.msgarea_mgr[pane].add_action_msg(
             'dialog-warning-symbolic', primary, secondary, _("_Reload"),
             self.revert_pane, pane)
+
+    def _debounced_reload(self, pane, display_name):
+        pending = self._pending_reload.pop(pane, None)
+        if pending is None:
+            return False
+        old_text = pending['old_text']
+
+        # A generation token per pane: if another reload starts for
+        # this pane before this one's poller below decides it's done,
+        # the poller can tell it's been superseded and back off, so
+        # only the most recent reload is ever allowed to move the
+        # cursor.
+        generation = self._reload_generation.get(pane, 0) + 1
+        self._reload_generation[pane] = generation
+        log.info(
+            "read-only auto-reload: reloading pane %d (generation %d)",
+            pane, generation)
+
+        self.revert_pane(pane)
+
+        mgr = self.msgarea_mgr[pane]
+        mgr.new_from_text_and_icon(
+            _("File %s changed on disk") % display_name,
+            _("Reloaded automatically"),
+            'dialog-information-symbolic').show()
+        mgr.set_msg_id(FileDiff.MSG_RELOADED)
+        GLib.timeout_add_seconds(4, self._clear_reload_notice, pane)
+
+        # The reload above is async (GtkSource.FileLoader), so the new
+        # text isn't in the buffer yet. Poll until it lands, then move
+        # the cursor to the first line that actually changed and
+        # scroll it into view -- reloading normally resets the view to
+        # the top of the file, which hides the change if it happened
+        # further down.
+        GLib.timeout_add(
+            50, self._wait_for_reload_and_scroll_to_change,
+            pane, old_text, generation)
+        return False
+
+    def _clear_reload_notice(self, pane):
+        mgr = self.msgarea_mgr[pane]
+        if mgr.get_msg_id() == FileDiff.MSG_RELOADED:
+            mgr.clear()
+        return False
+
+    def _wait_for_reload_and_scroll_to_change(
+            self, pane, old_text, generation):
+        if self._reload_generation.get(pane) != generation:
+            log.info(
+                "read-only auto-reload: pane %d generation %d "
+                "superseded, abandoning", pane, generation)
+            return False
+
+        buf = self.textbuffer[pane]
+        if buf.data.state == MeldBufferState.LOAD_ERROR:
+            log.info(
+                "read-only auto-reload: pane %d load error, "
+                "not scrolling", pane)
+            return False
+
+        # Reloading kicks off the normal comparison pipeline
+        # (_compare_files_internal -> _diff_files), which itself
+        # resets every buffer's cursor to the start and then jumps to
+        # the first pane-vs-pane diff chunk, via tasks queued on this
+        # same scheduler. That happens asynchronously and would
+        # otherwise undo our own repositioning if we ran first, so
+        # wait for the buffer to finish loading *and* for that whole
+        # pipeline to drain before moving the cursor ourselves.
+        if buf.data.state == MeldBufferState.LOADING or \
+                self.scheduler.tasks_pending():
+            return True
+
+        start, end = buf.get_bounds()
+        new_text = buf.get_text(start, end, False)
+        if new_text != old_text:
+            log.info(
+                "read-only auto-reload: pane %d text changed, "
+                "scrolling to first difference", pane)
+            # GtkTextView lazily validates line heights for regions of
+            # the buffer as they're needed, via its own idle-priority
+            # work. This poller runs at the (higher-priority) default
+            # timeout priority, so calling scroll_to_iter() directly
+            # here can race ahead of that validation for a
+            # newly-reloaded, not-yet-displayed part of the buffer and
+            # silently miss. Defer the actual scroll to a low-priority
+            # idle callback -- the same tier (or lower) that GTK's own
+            # layout validation and Meld's own go_to_chunk() use -- so
+            # it always runs after layout has settled.
+            GLib.idle_add(
+                self._scroll_to_first_change, pane, old_text, new_text,
+                priority=GLib.PRIORITY_LOW)
+        else:
+            log.info(
+                "read-only auto-reload: pane %d text unchanged "
+                "after reload, nothing to scroll to", pane)
+        return False
+
+    def _scroll_to_first_change(self, pane, old_text, new_text):
+        """Move the cursor to, and scroll to, the first line that
+        differs between old_text and new_text (the pane's own content
+        immediately before and after this reload)."""
+        matcher = difflib.SequenceMatcher(
+            None, old_text.splitlines(), new_text.splitlines(),
+            autojunk=False)
+        first_changed_line = next(
+            (j1 for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+             if tag != 'equal'),
+            None)
+        if first_changed_line is None:
+            log.info(
+                "read-only auto-reload: pane %d SequenceMatcher found "
+                "no differing lines despite text mismatch", pane)
+            return
+
+        buf = self.textbuffer[pane]
+        line = min(first_changed_line, buf.get_line_count() - 1)
+        log.info(
+            "read-only auto-reload: pane %d moving cursor to line %d "
+            "(buffer has %d lines)",
+            pane, line, buf.get_line_count())
+        it = buf.get_iter_at_line(line)
+        buf.place_cursor(it)
+        self.textview[pane].scroll_to_iter(it, 0.1, True, 0.0, 0.3)
 
     def refresh_comparison(self, *args):
         """Refresh the view by clearing and redoing all comparisons"""
@@ -2279,7 +2457,7 @@ class FileDiff(Gtk.Box, MeldDoc):
         dialog.run()
 
     def update_buffer_writable(self, buf):
-        writable = buf.data.writable
+        writable = buf.data.writable and not self.force_read_only
         self.recompute_label()
         index = self.textbuffer.index(buf)
         self.readonlytoggle[index].props.visible = not writable
