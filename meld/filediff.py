@@ -2031,19 +2031,16 @@ class FileDiff(Gtk.Box, MeldDoc):
             log.info(
                 "read-only auto-reload: pane %d text changed, "
                 "scrolling to first difference", pane)
-            # GtkTextView lazily validates line heights for regions of
-            # the buffer as they're needed, via its own idle-priority
-            # work. This poller runs at the (higher-priority) default
-            # timeout priority, so calling scroll_to_iter() directly
-            # here can race ahead of that validation for a
-            # newly-reloaded, not-yet-displayed part of the buffer and
-            # silently miss. Defer the actual scroll to a low-priority
-            # idle callback -- the same tier (or lower) that GTK's own
-            # layout validation and Meld's own go_to_chunk() use -- so
-            # it always runs after layout has settled.
-            GLib.idle_add(
-                self._scroll_to_first_change, pane, old_text, new_text,
-                priority=GLib.PRIORITY_LOW)
+            # Give GTK a real (wall-clock) beat to actually paint a
+            # frame before we try to scroll: back-to-back idle
+            # callbacks can all run within the same main-loop burst
+            # with no repaint in between (there's nothing forcing a
+            # pause without a compositor doing vsync), so chaining
+            # idle_add alone doesn't guarantee GTK's lazy line-height
+            # validation -- which happens as part of painting -- has
+            # actually had a chance to run.
+            GLib.timeout_add(
+                30, self._scroll_to_first_change, pane, old_text, new_text)
         else:
             log.info(
                 "read-only auto-reload: pane %d text unchanged "
@@ -2073,9 +2070,46 @@ class FileDiff(Gtk.Box, MeldDoc):
             "read-only auto-reload: pane %d moving cursor to line %d "
             "(buffer has %d lines)",
             pane, line, buf.get_line_count())
-        it = buf.get_iter_at_line(line)
-        buf.place_cursor(it)
-        self.textview[pane].scroll_to_iter(it, 0.1, True, 0.0, 0.3)
+        self._scroll_to_line_with_retry(pane, line, attempts_left=40)
+
+    def _scroll_to_line_with_retry(self, pane, line, attempts_left):
+        """Move the cursor to `line` and scroll it into view, retrying
+        a short real-time interval later if needed.
+
+        This mirrors go_to_chunk()'s own proven-working scroll, which
+        uses scroll_to_mark(buf.get_insert(), ...) rather than
+        scroll_to_iter() on a standalone iterator -- scrolling to a
+        live TextMark (which the layout machinery tracks and revalidates
+        on its own) turned out to behave far more reliably here than
+        scrolling to a plain TextIter snapshot. Retries are spaced by
+        a real timeout (not idle_add) so GTK actually gets a chance to
+        paint -- and validate line layout as part of that -- between
+        attempts, rather than every retry running back-to-back within
+        the same main-loop burst.
+        """
+        buf = self.textbuffer[pane]
+        view = self.textview[pane]
+        buf.place_cursor(buf.get_iter_at_line(line))
+        insert_mark = buf.get_insert()
+        view.scroll_to_mark(insert_mark, 0.1, True, 0.0, 0.3)
+
+        visible = view.get_visible_rect()
+        location = view.get_iter_location(buf.get_iter_at_mark(insert_mark))
+        on_screen = (
+            location.y >= visible.y
+            and location.y + location.height <= visible.y + visible.height)
+
+        if on_screen or attempts_left <= 0:
+            log.info(
+                "read-only auto-reload: pane %d scroll settled on "
+                "line %d (on_screen=%s, attempts_left=%d)",
+                pane, line, on_screen, attempts_left)
+            return False
+
+        GLib.timeout_add(
+            50, self._scroll_to_line_with_retry, pane, line,
+            attempts_left - 1)
+        return False
 
     def refresh_comparison(self, *args):
         """Refresh the view by clearing and redoing all comparisons"""
