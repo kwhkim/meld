@@ -290,6 +290,10 @@ class FileDiff(Gtk.Box, MeldDoc):
         # cycles: only a poller whose generation still matches the
         # latest value here is allowed to move the cursor.
         self._reload_generation = {}
+        # Per-pane: which reload generation (if any) currently holds
+        # that pane's GdkWindow frozen, so it can be thawed exactly
+        # once.
+        self._frozen_pane_generation = {}
         self.textbuffer = [v.get_buffer() for v in self.textview]
         self.buffer_texts = [BufferLines(b) for b in self.textbuffer]
         self.undosequence = UndoSequence(self.textbuffer)
@@ -1971,6 +1975,23 @@ class FileDiff(Gtk.Box, MeldDoc):
             "read-only auto-reload: reloading pane %d (generation %d)",
             pane, generation)
 
+        # Meld's own reload pipeline always resets to the top of the
+        # file and jumps to the first pane-vs-pane diff chunk before
+        # we get a turn to move to where the real edit happened, which
+        # is a distracting flash of the wrong location. Freezing the
+        # pane's GdkWindow keeps whatever was already on screen
+        # displayed as-is (rather than going blank, which is what
+        # set_opacity(0) did) while everything updates underneath,
+        # then flushes straight to the final settled state on thaw --
+        # skipping every intermediate frame instead of just hiding
+        # them. _ensure_pane_visible is a safety net in case some path
+        # here doesn't reach its normal restore point.
+        window = self.scrolledwindow[pane].get_window()
+        if window:
+            window.freeze_updates()
+            self._frozen_pane_generation[pane] = generation
+        GLib.timeout_add_seconds(3, self._ensure_pane_visible, pane, generation)
+
         self.revert_pane(pane)
 
         mgr = self.msgarea_mgr[pane]
@@ -1998,6 +2019,23 @@ class FileDiff(Gtk.Box, MeldDoc):
             mgr.clear()
         return False
 
+    def _ensure_pane_visible(self, pane, generation):
+        """Thaw a pane's frozen GdkWindow after a reload, but only
+        once, and only for the freeze that this exact generation put
+        in place -- freeze/thaw calls nest as a counter, so calling
+        thaw more times than we froze (e.g. from both the normal
+        completion path and the safety-net timeout firing afterwards)
+        would desync it. A newer generation's own freeze/thaw pair
+        owns visibility once it starts, so this is a no-op then too.
+        """
+        if self._frozen_pane_generation.get(pane) != generation:
+            return False
+        self._frozen_pane_generation[pane] = None
+        window = self.scrolledwindow[pane].get_window()
+        if window:
+            window.thaw_updates()
+        return False
+
     def _wait_for_reload_and_scroll_to_change(
             self, pane, old_text, generation):
         if self._reload_generation.get(pane) != generation:
@@ -2011,6 +2049,7 @@ class FileDiff(Gtk.Box, MeldDoc):
             log.info(
                 "read-only auto-reload: pane %d load error, "
                 "not scrolling", pane)
+            self._ensure_pane_visible(pane, generation)
             return False
 
         # Reloading kicks off the normal comparison pipeline
@@ -2020,7 +2059,8 @@ class FileDiff(Gtk.Box, MeldDoc):
         # same scheduler. That happens asynchronously and would
         # otherwise undo our own repositioning if we ran first, so
         # wait for the buffer to finish loading *and* for that whole
-        # pipeline to drain before moving the cursor ourselves.
+        # pipeline to drain before moving the cursor ourselves. The
+        # pane stays hidden (see _debounced_reload) while this goes on.
         if buf.data.state == MeldBufferState.LOADING or \
                 self.scheduler.tasks_pending():
             return True
@@ -2040,17 +2080,21 @@ class FileDiff(Gtk.Box, MeldDoc):
             # validation -- which happens as part of painting -- has
             # actually had a chance to run.
             GLib.timeout_add(
-                30, self._scroll_to_first_change, pane, old_text, new_text)
+                30, self._scroll_to_first_change,
+                pane, old_text, new_text, generation)
         else:
             log.info(
                 "read-only auto-reload: pane %d text unchanged "
                 "after reload, nothing to scroll to", pane)
+            self._ensure_pane_visible(pane, generation)
         return False
 
-    def _scroll_to_first_change(self, pane, old_text, new_text):
+    def _scroll_to_first_change(self, pane, old_text, new_text, generation):
         """Move the cursor to, and scroll to, the first line that
         differs between old_text and new_text (the pane's own content
         immediately before and after this reload)."""
+        if self._reload_generation.get(pane) != generation:
+            return
         matcher = difflib.SequenceMatcher(
             None, old_text.splitlines(), new_text.splitlines(),
             autojunk=False)
@@ -2062,6 +2106,7 @@ class FileDiff(Gtk.Box, MeldDoc):
             log.info(
                 "read-only auto-reload: pane %d SequenceMatcher found "
                 "no differing lines despite text mismatch", pane)
+            self._ensure_pane_visible(pane, generation)
             return
 
         buf = self.textbuffer[pane]
@@ -2070,9 +2115,10 @@ class FileDiff(Gtk.Box, MeldDoc):
             "read-only auto-reload: pane %d moving cursor to line %d "
             "(buffer has %d lines)",
             pane, line, buf.get_line_count())
-        self._scroll_to_line_with_retry(pane, line, attempts_left=40)
+        self._scroll_to_line_with_retry(
+            pane, line, attempts_left=40, generation=generation)
 
-    def _scroll_to_line_with_retry(self, pane, line, attempts_left):
+    def _scroll_to_line_with_retry(self, pane, line, attempts_left, generation):
         """Move the cursor to `line` and scroll it into view, retrying
         a short real-time interval later if needed.
 
@@ -2087,6 +2133,9 @@ class FileDiff(Gtk.Box, MeldDoc):
         attempts, rather than every retry running back-to-back within
         the same main-loop burst.
         """
+        if self._reload_generation.get(pane) != generation:
+            return False
+
         buf = self.textbuffer[pane]
         view = self.textview[pane]
         buf.place_cursor(buf.get_iter_at_line(line))
@@ -2104,11 +2153,12 @@ class FileDiff(Gtk.Box, MeldDoc):
                 "read-only auto-reload: pane %d scroll settled on "
                 "line %d (on_screen=%s, attempts_left=%d)",
                 pane, line, on_screen, attempts_left)
+            self._ensure_pane_visible(pane, generation)
             return False
 
         GLib.timeout_add(
             50, self._scroll_to_line_with_retry, pane, line,
-            attempts_left - 1)
+            attempts_left - 1, generation)
         return False
 
     def refresh_comparison(self, *args):
