@@ -317,6 +317,11 @@ class FileDiff(Gtk.Box, MeldDoc):
         # another editor) while still tracking and jumping to each
         # change silently.
         self._last_reload_time = {}
+        # Set (process-wide within this tab, not per-pane) just before
+        # a read-only auto-reload's revert_pane() call, and consumed
+        # by the very next _compare_files_internal() run it triggers.
+        # See _compare_files_internal.
+        self._suppress_reset_on_next_diff = False
         self.textbuffer = [v.get_buffer() for v in self.textview]
         self.buffer_texts = [BufferLines(b) for b in self.textbuffer]
         self.undosequence = UndoSequence(self.textbuffer)
@@ -1922,7 +1927,14 @@ class FileDiff(Gtk.Box, MeldDoc):
     def _compare_files_internal(self):
         for i in self._merge_files():
             yield i
-        for i in self._diff_files():
+        # See _debounced_reload: a read-only auto-reload sets this to
+        # ask _diff_files() to skip its usual reset-cursor-to-start
+        # and jump-to-first-chunk behaviour, since we're about to
+        # position the cursor ourselves at the actual edit location
+        # instead.
+        refresh = self._suppress_reset_on_next_diff
+        self._suppress_reset_on_next_diff = False
+        for i in self._diff_files(refresh=refresh):
             yield i
         focus_pane = 0 if self.num_panes < 2 else 1
         self.textview[focus_pane].grab_focus()
@@ -2009,12 +2021,29 @@ class FileDiff(Gtk.Box, MeldDoc):
         # skipping every intermediate frame instead of just hiding
         # them. _ensure_pane_visible is a safety net in case some path
         # here doesn't reach its normal restore point.
-        window = self.scrolledwindow[pane].get_window()
+        #
+        # This freezes the whole top-level window, not just this
+        # pane's own scrolled window: revert_pane() below unconditionally
+        # clears any message area left over from a previous reload
+        # (e.g. a "Reloaded automatically" notice still on screen from
+        # one within the last --auto-reload cooldown window), and
+        # removing that notice reflows the pane to reclaim its space --
+        # a real resize, not just a repaint, which freezing only this
+        # pane's own surface doesn't mask.
+        toplevel = self.get_toplevel()
+        window = toplevel.get_window() if toplevel else None
         if window:
             window.freeze_updates()
             self._frozen_pane_generation[pane] = generation
         GLib.timeout_add_seconds(3, self._ensure_pane_visible, pane, generation)
 
+        # Skip the reset-to-start/jump-to-first-chunk step that would
+        # otherwise run once this reload's comparison finishes -- see
+        # _compare_files_internal. We're about to move the cursor to
+        # the actual edit location ourselves, and when that location
+        # is already where the view is sitting (e.g. repeated edits to
+        # the same line), this avoids ever moving away from it at all.
+        self._suppress_reset_on_next_diff = True
         self.revert_pane(pane)
 
         # Suppress the notice bar during a burst of closely-spaced
@@ -2067,7 +2096,8 @@ class FileDiff(Gtk.Box, MeldDoc):
         if self._frozen_pane_generation.get(pane) != generation:
             return False
         self._frozen_pane_generation[pane] = None
-        window = self.scrolledwindow[pane].get_window()
+        toplevel = self.get_toplevel()
+        window = toplevel.get_window() if toplevel else None
         if window:
             window.thaw_updates()
         return False

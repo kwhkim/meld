@@ -317,6 +317,16 @@ class MeldApp(Gtk.Application):
 
         if options.read_only:
             FileDiff.force_read_only = True
+            # Auto-reload moves the cursor/scroll position
+            # programmatically, sometimes on every keystroke-driven
+            # save from another editor. GTK can apply a brief eased
+            # transition to scroll position changes even when they're
+            # not user-driven, which shows up as a quick settle/jitter
+            # right where the cursor lands. Disabling animations makes
+            # every such move an instant snap instead.
+            settings = Gtk.Settings.get_default()
+            if settings:
+                settings.props.gtk_enable_animations = False
 
         if options.auto_reload == 'no-msg':
             FileDiff.suppress_reload_message = True
