@@ -156,6 +156,32 @@ class FileDiff(Gtk.Box, MeldDoc):
     #: set, which skips the notice including the first one.
     reload_message_cooldown: float = 10.0
 
+    #: Process-wide switch set by ``--obsidian``. Unlike
+    #: force_read_only, panes stay fully editable -- this is for
+    #: cooperatively sharing a file with another program (Obsidian)
+    #: that's also actively saving it. The invariant is that whichever
+    #: side currently has unsaved local changes "owns" the file:
+    #:  - The same auto-reload machinery as --read-only runs
+    #:    continuously, but only while a pane's buffer is unmodified,
+    #:    so it never clobbers local edits in progress.
+    #:  - The moment the Meld window loses focus (the user is
+    #:    presumably switching to the other program to keep editing
+    #:    there), any pane with unsaved local changes is saved, which
+    #:    both persists the edit and hands reload ownership back.
+    #:  - It also saves a short idle period (obsidian_idle_save_delay)
+    #:    after the last keystroke, even while Meld still has focus,
+    #:    so changes show up on Obsidian's side quickly rather than
+    #:    only once you switch away.
+    #: A genuine on-disk conflict (the file also changed since Meld
+    #: last read it) is never silently overwritten either way --
+    #: saving goes through the existing save_file()/current_on_disk()
+    #: conflict check, same as a manual save.
+    obsidian_mode: bool = False
+
+    #: Seconds of no further edits before --obsidian saves a pane on
+    #: its own, independent of focus.
+    obsidian_idle_save_delay: float = 1.0
+
     ignore_blank_lines = GObject.Property(
         type=bool,
         nick="Ignore blank lines",
@@ -322,6 +348,15 @@ class FileDiff(Gtk.Box, MeldDoc):
         # by the very next _compare_files_internal() run it triggers.
         # See _compare_files_internal.
         self._suppress_reset_on_next_diff = False
+        if FileDiff.obsidian_mode:
+            # Deferred until the widget is actually mapped into a real
+            # top-level window, rather than connected eagerly here,
+            # since get_toplevel() isn't meaningful before that.
+            self.connect_after('map', self._setup_obsidian_focus_tracking)
+        # Per-pane: pending GLib timeout id for --obsidian's
+        # idle-after-typing autosave, so each new edit can cancel and
+        # re-arm it rather than stacking up timers.
+        self._pending_obsidian_save = {}
         self.textbuffer = [v.get_buffer() for v in self.textview]
         self.buffer_texts = [BufferLines(b) for b in self.textbuffer]
         self.undosequence = UndoSequence(self.textbuffer)
@@ -672,7 +707,13 @@ class FileDiff(Gtk.Box, MeldDoc):
                 "delete-range", self.after_text_delete_range)
             id4 = buf.connect(
                 "notify::cursor-position", self.on_cursor_position_changed)
-            buf.handlers = id0, id1, id2, id3, id4
+            handlers = [id0, id1, id2, id3, id4]
+            if self.obsidian_mode:
+                handlers.append(buf.connect_after(
+                    "insert-text", self._on_obsidian_buffer_edited))
+                handlers.append(buf.connect_after(
+                    "delete-range", self._on_obsidian_buffer_edited))
+            buf.handlers = tuple(handlers)
 
         if self.comparison_mode == FileComparisonMode.AutoMerge:
             self.textview[0].set_editable(0)
@@ -1946,6 +1987,64 @@ class FileDiff(Gtk.Box, MeldDoc):
             for i, label in enumerate(labels):
                 self.filelabel[i].props.custom_label = label
 
+    def _setup_obsidian_focus_tracking(self, *args):
+        """Connect to the top-level window's active-state once this
+        tab is actually mapped into one, so --obsidian's blur handler
+        can save unsaved panes whenever you switch away from Meld.
+
+        Guarded against running more than once: "map" can fire again
+        (e.g. switching back to this tab), and get_toplevel() is only
+        meaningful once actually attached to a real window.
+        """
+        if getattr(self, '_obsidian_toplevel_connected', False):
+            return
+        toplevel = self.get_toplevel()
+        if not isinstance(toplevel, Gtk.Window):
+            return
+        toplevel.connect(
+            'notify::is-active', self._on_obsidian_toplevel_active_changed)
+        self._obsidian_toplevel_connected = True
+
+    def _on_obsidian_toplevel_active_changed(self, window, pspec):
+        if window.is_active():
+            return
+        for pane in range(self.num_panes):
+            if self.textbuffer[pane].get_modified():
+                log.info(
+                    "obsidian mode: window lost focus, saving pane %d",
+                    pane)
+                # save_file() already refuses to blindly overwrite if
+                # the file also changed on disk since Meld last read
+                # it (current_on_disk()) -- it shows the same
+                # "Save Anyway / Don't Save" prompt a manual save
+                # would, rather than silently picking a side. That's
+                # a genuine, rare conflict (both sides edited at once)
+                # this handoff can't resolve on its own.
+                self.save_file(pane)
+
+    def _on_obsidian_buffer_edited(self, buf, *args):
+        """Re-arm --obsidian's idle-after-typing autosave timer for
+        this pane. Connected to both insert-text and delete-range
+        (whose signal signatures differ, hence *args), so any edit
+        counts and resets the countdown -- only once you actually
+        pause does the save fire, rather than saving mid-keystroke."""
+        pane = self.textbuffer.index(buf)
+        pending = self._pending_obsidian_save.get(pane)
+        if pending is not None:
+            GLib.source_remove(pending)
+        self._pending_obsidian_save[pane] = GLib.timeout_add(
+            int(self.obsidian_idle_save_delay * 1000),
+            self._obsidian_idle_save, pane)
+
+    def _obsidian_idle_save(self, pane):
+        self._pending_obsidian_save.pop(pane, None)
+        if self.textbuffer[pane].get_modified():
+            log.info(
+                "obsidian mode: idle after edit, saving pane %d", pane)
+            # Same conflict-safe save_file() as the blur handler.
+            self.save_file(pane)
+        return False
+
     def notify_file_changed(self, data):
         try:
             pane = [b.data for b in self.textbuffer].index(data)
@@ -1957,10 +2056,14 @@ class FileDiff(Gtk.Box, MeldDoc):
         # In forced read-only mode, the pane can never have unsaved
         # local edits, so an external change on disk can never clobber
         # anything by reloading it straight away instead of waiting on
-        # the user to click "Reload".
-        if self.force_read_only and not self.textbuffer[pane].get_modified():
+        # the user to click "Reload". In --obsidian mode the pane
+        # *can* have local edits, so the same auto-reload only kicks
+        # in while there aren't any right now -- see obsidian_mode's
+        # docstring for the full ownership-handoff reasoning.
+        if (self.force_read_only or self.obsidian_mode) \
+                and not self.textbuffer[pane].get_modified():
             log.info(
-                "read-only auto-reload: change notified for pane %d (%s)",
+                "auto-reload: change notified for pane %d (%s)",
                 pane, display_name)
             # A single external save often fires this notification
             # more than once (see _pending_reload's comment in
@@ -1975,12 +2078,12 @@ class FileDiff(Gtk.Box, MeldDoc):
                 pending = {'old_text': buf.get_text(start, end, False)}
                 self._pending_reload[pane] = pending
                 log.info(
-                    "read-only auto-reload: starting debounce window "
+                    "auto-reload: starting debounce window "
                     "for pane %d", pane)
             else:
                 GLib.source_remove(pending['timeout_id'])
                 log.info(
-                    "read-only auto-reload: another change arrived, "
+                    "auto-reload: another change arrived, "
                     "restarting debounce window for pane %d", pane)
 
             pending['timeout_id'] = GLib.timeout_add(
@@ -2007,7 +2110,7 @@ class FileDiff(Gtk.Box, MeldDoc):
         generation = self._reload_generation.get(pane, 0) + 1
         self._reload_generation[pane] = generation
         log.info(
-            "read-only auto-reload: reloading pane %d (generation %d)",
+            "auto-reload: reloading pane %d (generation %d)",
             pane, generation)
 
         # Meld's own reload pipeline always resets to the top of the
@@ -2106,14 +2209,14 @@ class FileDiff(Gtk.Box, MeldDoc):
             self, pane, old_text, generation):
         if self._reload_generation.get(pane) != generation:
             log.info(
-                "read-only auto-reload: pane %d generation %d "
+                "auto-reload: pane %d generation %d "
                 "superseded, abandoning", pane, generation)
             return False
 
         buf = self.textbuffer[pane]
         if buf.data.state == MeldBufferState.LOAD_ERROR:
             log.info(
-                "read-only auto-reload: pane %d load error, "
+                "auto-reload: pane %d load error, "
                 "not scrolling", pane)
             self._ensure_pane_visible(pane, generation)
             return False
@@ -2135,7 +2238,7 @@ class FileDiff(Gtk.Box, MeldDoc):
         new_text = buf.get_text(start, end, False)
         if new_text != old_text:
             log.info(
-                "read-only auto-reload: pane %d text changed, "
+                "auto-reload: pane %d text changed, "
                 "scrolling to first difference", pane)
             # Give GTK a real (wall-clock) beat to actually paint a
             # frame before we try to scroll: back-to-back idle
@@ -2150,7 +2253,7 @@ class FileDiff(Gtk.Box, MeldDoc):
                 pane, old_text, new_text, generation)
         else:
             log.info(
-                "read-only auto-reload: pane %d text unchanged "
+                "auto-reload: pane %d text unchanged "
                 "after reload, nothing to scroll to", pane)
             self._ensure_pane_visible(pane, generation)
         return False
@@ -2170,7 +2273,7 @@ class FileDiff(Gtk.Box, MeldDoc):
             None)
         if first_changed_line is None:
             log.info(
-                "read-only auto-reload: pane %d SequenceMatcher found "
+                "auto-reload: pane %d SequenceMatcher found "
                 "no differing lines despite text mismatch", pane)
             self._ensure_pane_visible(pane, generation)
             return
@@ -2178,7 +2281,7 @@ class FileDiff(Gtk.Box, MeldDoc):
         buf = self.textbuffer[pane]
         line = min(first_changed_line, buf.get_line_count() - 1)
         log.info(
-            "read-only auto-reload: pane %d moving cursor to line %d "
+            "auto-reload: pane %d moving cursor to line %d "
             "(buffer has %d lines)",
             pane, line, buf.get_line_count())
         self._scroll_to_line_with_retry(
@@ -2216,7 +2319,7 @@ class FileDiff(Gtk.Box, MeldDoc):
 
         if on_screen or attempts_left <= 0:
             log.info(
-                "read-only auto-reload: pane %d scroll settled on "
+                "auto-reload: pane %d scroll settled on "
                 "line %d (on_screen=%s, attempts_left=%d)",
                 pane, line, on_screen, attempts_left)
             self._ensure_pane_visible(pane, generation)

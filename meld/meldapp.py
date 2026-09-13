@@ -277,11 +277,21 @@ class MeldApp(Gtk.Application):
             dest="auto_reload", default=None,
             help=_(
                 "Configure the \"changed on disk\" notice for "
-                "--read-only auto-reloads (the reload and "
+                "--read-only/--obsidian auto-reloads (the reload and "
                 "cursor-tracking always happen regardless): a number "
                 "is the minimum pause in seconds between notices "
                 "(e.g. 10), 'Inf' shows only the very first notice "
                 "ever, and 'no-msg' suppresses it completely"))
+        parser.add_option(
+            "", "--obsidian", action="store_true", default=False,
+            help=_(
+                "Keep panes fully editable while cooperatively "
+                "sharing them with another program (e.g. Obsidian) "
+                "that's also actively saving the same files: "
+                "auto-reload a pane whenever it has no unsaved local "
+                "edits, and save it automatically whenever the Meld "
+                "window loses focus while it does. Mutually exclusive "
+                "with --read-only"))
         parser.add_option(
             "-o", "--output", action="store", type="string",
             dest="outfile", default=None,
@@ -315,8 +325,17 @@ class MeldApp(Gtk.Application):
             cleanup()
             return parser.exit_status
 
+        if options.read_only and options.obsidian:
+            parser.local_error(
+                _("--read-only and --obsidian are mutually exclusive"))
+
         if options.read_only:
             FileDiff.force_read_only = True
+
+        if options.obsidian:
+            FileDiff.obsidian_mode = True
+
+        if options.read_only or options.obsidian:
             # Auto-reload moves the cursor/scroll position
             # programmatically, sometimes on every keystroke-driven
             # save from another editor. GTK can apply a brief eased
