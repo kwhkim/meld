@@ -19,6 +19,7 @@ import difflib
 import functools
 import logging
 import math
+import time
 from enum import Enum
 from typing import Optional, Tuple, Type
 
@@ -138,6 +139,22 @@ class FileDiff(Gtk.Box, MeldDoc):
     #: underlying files' on-disk permissions, so Meld can never write to
     #: files that are being edited concurrently by another program.
     force_read_only: bool = False
+
+    #: Process-wide switch set by ``--auto-reload=no-msg``. When true,
+    #: the "changed on disk / Reloaded automatically" notice is never
+    #: shown for read-only auto-reloads, regardless of timing -- the
+    #: reload and cursor-tracking still happen, just silently.
+    suppress_reload_message: bool = False
+
+    #: Process-wide minimum pause (seconds) since the last auto-reload
+    #: notice before showing another one, set by
+    #: ``--auto-reload=<seconds>``. ``float('inf')`` (from
+    #: ``--auto-reload=Inf``) means only the very first notice for a
+    #: pane is ever shown -- every later reload in that pane's
+    #: lifetime falls silent, same as ``no-msg`` except for that one
+    #: first message. Ignored entirely when suppress_reload_message is
+    #: set, which skips the notice including the first one.
+    reload_message_cooldown: float = 10.0
 
     ignore_blank_lines = GObject.Property(
         type=bool,
@@ -294,6 +311,12 @@ class FileDiff(Gtk.Box, MeldDoc):
         # that pane's GdkWindow frozen, so it can be thawed exactly
         # once.
         self._frozen_pane_generation = {}
+        # Per-pane: monotonic time of the last auto-reload, so we can
+        # suppress the "changed on disk" notice during a burst of
+        # closely-spaced saves (e.g. someone typing steadily in
+        # another editor) while still tracking and jumping to each
+        # change silently.
+        self._last_reload_time = {}
         self.textbuffer = [v.get_buffer() for v in self.textview]
         self.buffer_texts = [BufferLines(b) for b in self.textbuffer]
         self.undosequence = UndoSequence(self.textbuffer)
@@ -1994,13 +2017,26 @@ class FileDiff(Gtk.Box, MeldDoc):
 
         self.revert_pane(pane)
 
-        mgr = self.msgarea_mgr[pane]
-        mgr.new_from_text_and_icon(
-            _("File %s changed on disk") % display_name,
-            _("Reloaded automatically"),
-            'dialog-information-symbolic').show()
-        mgr.set_msg_id(FileDiff.MSG_RELOADED)
-        GLib.timeout_add_seconds(4, self._clear_reload_notice, pane)
+        # Suppress the notice bar during a burst of closely-spaced
+        # saves (e.g. steady typing in another editor, each autosave
+        # triggering its own reload) -- it's distracting to have it
+        # pop up and vanish every few seconds. The reload and rescroll
+        # above still happen every time regardless; only the message
+        # is skipped.
+        now = time.monotonic()
+        last = self._last_reload_time.get(pane)
+        self._last_reload_time[pane] = now
+        show_message = (
+            not self.suppress_reload_message
+            and (last is None or now - last >= self.reload_message_cooldown))
+        if show_message:
+            mgr = self.msgarea_mgr[pane]
+            mgr.new_from_text_and_icon(
+                _("File %s changed on disk") % display_name,
+                _("Reloaded automatically"),
+                'dialog-information-symbolic').show()
+            mgr.set_msg_id(FileDiff.MSG_RELOADED)
+            GLib.timeout_add_seconds(4, self._clear_reload_notice, pane)
 
         # The reload above is async (GtkSource.FileLoader), so the new
         # text isn't in the buffer yet. Poll until it lands, then move

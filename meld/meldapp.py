@@ -273,6 +273,16 @@ class MeldApp(Gtk.Application):
                 "Open comparisons read-only, never writing to the "
                 "compared files regardless of their on-disk permissions"))
         parser.add_option(
+            "", "--auto-reload", action="store", type="string",
+            dest="auto_reload", default=None,
+            help=_(
+                "Configure the \"changed on disk\" notice for "
+                "--read-only auto-reloads (the reload and "
+                "cursor-tracking always happen regardless): a number "
+                "is the minimum pause in seconds between notices "
+                "(e.g. 10), 'Inf' shows only the very first notice "
+                "ever, and 'no-msg' suppresses it completely"))
+        parser.add_option(
             "-o", "--output", action="store", type="string",
             dest="outfile", default=None,
             help=_("Set the target file for saving a merge result"))
@@ -307,6 +317,22 @@ class MeldApp(Gtk.Application):
 
         if options.read_only:
             FileDiff.force_read_only = True
+
+        if options.auto_reload == 'no-msg':
+            FileDiff.suppress_reload_message = True
+        elif options.auto_reload is not None:
+            try:
+                cooldown = float(options.auto_reload)
+            except ValueError:
+                cooldown = None
+            if cooldown is None or cooldown < 0:
+                parser.local_error(
+                    _(
+                        "invalid --auto-reload value %r (expected "
+                        "a pause time in seconds, 'Inf', or 'no-msg')"
+                    ) % options.auto_reload)
+            else:
+                FileDiff.reload_message_cooldown = cooldown
 
         if len(args) > 3:
             parser.local_error(_("too many arguments (wanted 0-3, got %d)") %
